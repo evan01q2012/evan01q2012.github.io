@@ -1,0 +1,920 @@
+-- luxury manager ✨
+-- admin proxy filtering, debug logging, fixed spin, fling, and auto-stat syncing 💅
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TextChatService = game:FindService("TextChatService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local GuiService = game:GetService("GuiService")
+local ScriptContext = game:GetService("ScriptContext")
+
+local localPlayer = Players.LocalPlayer
+
+-- ✨ configuration & state ✨
+local owners = { ["tayIorkeke33"] = true }
+local isMain = owners[localPlayer.Name] or false
+local ipcFile = "keke_ipc.txt"
+local logFile = "keke_debug_logs.txt"
+local lastProcessedTick = 0
+
+local lastWs = 16
+local lastJp = 50
+
+local connections: { RBXScriptConnection } = {}
+
+-- movement & anim states
+local bangAnim: Animation? = nil
+local bangTrack: AnimationTrack? = nil
+local bangDiedConn: RBXScriptConnection? = nil
+local bangLoopConn: RBXScriptConnection? = nil
+
+local danceTrack: AnimationTrack? = nil
+
+local followTarget = nil
+local followConn = nil
+local posQueue = {} 
+
+local infJumpConn = nil
+local noclipConn = nil
+local flingConn = nil
+
+-- 💅 secret dictionary for the commands 💅
+local cmdMap = {
+	bring = "k", goto = "g", follow = "f", unfollow = "u", 
+	bang = "b", unbang = "x", spin = "s", unspin = "y", 
+	jump = "j", sit = "t", freeze = "z", thaw = "w", 
+	infjump = "i", uninf = "o", line = "l", column = "c", 
+	dance = "d", undance = "v", noclip = "n", clip = "p",
+	fling = "fl", unfling = "uf", ws = "ws", jp = "jp",
+	quit = "q", erase = "e", reset = "r", grant = "h"
+}
+
+-- 📝 the debugging sector 📝
+local function logDebug(msg: string)
+	pcall(function()
+		local timeStr = os.date("%H:%M:%S")
+		local line = string.format("[%s] [%s] %s\n", timeStr, localPlayer.Name, msg)
+		
+		if appendfile then
+			appendfile(logFile, line)
+		elseif writefile and readfile then
+			local current = ""
+			if isfile and isfile(logFile) then
+				current = readfile(logFile) or ""
+			end
+			writefile(logFile, current .. line)
+		end
+	end)
+end
+
+ScriptContext.Error:Connect(function(message, trace)
+	logDebug("🐛 caught error: " .. tostring(message))
+end)
+
+logDebug("✨ luxury manager active! isMain: " .. tostring(isMain))
+
+-- 💅 helpers 💅
+local function getRoot(char: Instance): BasePart?
+	if not char then return nil end
+	return char:FindFirstChild("HumanoidRootPart") :: BasePart
+end
+
+local function getTorso(char: Instance): BasePart?
+	if not char then return nil end
+	return (char:FindFirstChild("Torso") or char:FindFirstChild("UpperTorso")) :: BasePart
+end
+
+local function isR15(char: Instance): boolean
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	return hum and hum.RigType == Enum.HumanoidRigType.R15 or false
+end
+
+local function findPlayersByName(query: string): { Player }
+	local results = {}
+	if not query or query == "" then return results end
+	local lower = string.lower(query)
+	for _, p in ipairs(Players:GetPlayers()) do
+		if string.find(string.lower(p.Name), lower, 1, true) then
+			table.insert(results, p)
+		end
+	end
+	return results
+end
+
+-- 📝 universally send a command to the secret file
+local function sendCommand(cmdLetter: string, args: string, senderOverride: string?)
+	pcall(function()
+		if writefile then
+			local data = {
+				t = os.clock() + math.random(),
+				s = senderOverride or localPlayer.Name,
+				c = cmdLetter,
+				a = args or ""
+			}
+			logDebug("📤 pushing command to file: " .. cmdLetter .. " | args: " .. tostring(args))
+			writefile(ipcFile, HttpService:JSONEncode(data))
+		end
+	end)
+end
+
+-- 🛑 alt anti-lag & optimization 🛑
+if not isMain then
+	pcall(function()
+		if setfpscap then setfpscap(30) end
+		
+		settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+		game.Lighting.GlobalShadows = false
+		game.Lighting.FogEnd = 9e9
+		game.Lighting.Brightness = 1
+		
+		for _, v in ipairs(workspace:GetDescendants()) do
+			if v:IsA("BasePart") then
+				v.Material = Enum.Material.SmoothPlastic
+				v.Reflectance = 0
+			elseif v:IsA("Decal") or v:IsA("Texture") then
+				v:Destroy()
+			end
+		end
+		
+		workspace.DescendantAdded:Connect(function(v)
+			if v:IsA("BasePart") then
+				v.Material = Enum.Material.SmoothPlastic
+			elseif v:IsA("Decal") or v:IsA("Texture") then
+				v:Destroy()
+			end
+		end)
+	end)
+end
+
+-- 🏃‍♀️ command implementations 🏃‍♀️
+local function cleanupBang()
+	if bangDiedConn then pcall(function() bangDiedConn:Disconnect() end) end
+	if bangLoopConn then pcall(function() bangLoopConn:Disconnect() end) end
+	bangDiedConn = nil
+	bangLoopConn = nil
+	if bangTrack then pcall(function() bangTrack:Stop() end) end
+	if bangAnim then pcall(function() bangAnim:Destroy() end) end
+	bangTrack = nil
+	bangAnim = nil
+end
+
+local function cmd_reset()
+	local char = localPlayer.Character
+	if char then
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		if hum then hum.Health = 0 end
+	end
+end
+
+local function cmd_goto(targetName: string)
+	if not targetName or targetName == "" then return end
+	local targets = findPlayersByName(targetName)
+	if #targets == 0 then return end
+
+	local targetPlayer = targets[1]
+	if targetPlayer == localPlayer then return end
+
+	local myChar = localPlayer.Character
+	local otherChar = targetPlayer.Character
+	if not myChar or not otherChar then return end
+
+	local myHum = myChar:FindFirstChildOfClass("Humanoid")
+	if myHum and myHum.SeatPart then
+		myHum.Sit = false
+		task.wait(0.1)
+	end
+
+	local myRoot = getRoot(myChar)
+	local otherRoot = getRoot(otherChar)
+	if myRoot and otherRoot then
+		myRoot.CFrame = otherRoot.CFrame + Vector3.new(2, 0, 2)
+		pcall(function()
+			myRoot.AssemblyLinearVelocity = Vector3.zero
+			myRoot.AssemblyAngularVelocity = Vector3.zero
+		end)
+	end
+end
+
+local function cmd_bang(targetName: string, speed: string?)
+	cleanupBang()
+	task.wait()
+
+	local char = localPlayer.Character or localPlayer.CharacterAdded:Wait()
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not hum then return end
+
+	local animator = hum:FindFirstChildOfClass("Animator") or Instance.new("Animator", hum)
+	bangAnim = Instance.new("Animation")
+	bangAnim.AnimationId = (isR15(char) and "rbxassetid://5918726674") or "rbxassetid://148840371"
+
+	pcall(function() bangTrack = animator:LoadAnimation(bangAnim) end)
+	if bangTrack then
+		bangTrack:Play(0.1, 1, 1)
+		pcall(function() bangTrack:AdjustSpeed(tonumber(speed) or 3) end)
+	end
+
+	bangDiedConn = hum.Died:Connect(function() cleanupBang() end)
+
+	if targetName and targetName ~= "" then
+		local targets = findPlayersByName(targetName)
+		if #targets > 0 then
+			local targetPlayer = targets[1]
+			if targetPlayer == localPlayer then return end
+			
+			local offset = CFrame.new(0, 0, 1.1)
+			bangLoopConn = RunService.Stepped:Connect(function()
+				pcall(function()
+					local otherTorso = getTorso(targetPlayer.Character)
+					local myRoot = getRoot(char)
+					if otherTorso and myRoot then
+						myRoot.CFrame = otherTorso.CFrame * offset
+					end
+				end)
+			end)
+		end
+	end
+end
+
+local function cmd_follow(targetName: string)
+	if followConn then pcall(function() followConn:Disconnect() end) followConn = nil end
+	posQueue = {} 
+	
+	if not targetName or targetName == "" then return end
+	local targets = findPlayersByName(targetName)
+	if #targets == 0 then return end
+	
+	followTarget = targets[1]
+	if followTarget == localPlayer then 
+		followTarget = nil 
+		return 
+	end
+	
+	followConn = RunService.Heartbeat:Connect(function()
+		if not followTarget or not followTarget.Character then return end
+		local myChar = localPlayer.Character
+		if not myChar then return end
+		local myHum = myChar:FindFirstChildOfClass("Humanoid")
+		local targetRoot = getRoot(followTarget.Character)
+		
+		if myHum and targetRoot then
+			table.insert(posQueue, {pos = targetRoot.Position, time = tick()})
+			while #posQueue > 0 and tick() - posQueue[1].time >= 0.85 do
+				local delayedPoint = table.remove(posQueue, 1)
+				myHum:MoveTo(delayedPoint.pos)
+			end
+		end
+	end)
+end
+
+local function cmd_unfollow()
+	followTarget = nil
+	posQueue = {}
+	if followConn then pcall(function() followConn:Disconnect() end) followConn = nil end
+end
+
+local function cmd_formation(senderName: string, isSideways: boolean)
+	cmd_unfollow()
+	cmd_unspin()
+	cleanupBang()
+
+	local leader = Players:FindFirstChild(senderName)
+	if not leader or not leader.Character then return end
+	local leaderRoot = getRoot(leader.Character)
+	if not leaderRoot then return end
+
+	local myChar = localPlayer.Character
+	if not myChar then return end
+	local myHum = myChar:FindFirstChildOfClass("Humanoid")
+	if myHum and myHum.SeatPart then
+		myHum.Sit = false
+		task.wait(0.1)
+	end
+
+	local myRoot = getRoot(myChar)
+	if not myRoot then return end
+
+	local nearby = {}
+	for _, p in ipairs(Players:GetPlayers()) do
+		if p.Name ~= senderName and p.Character then
+			local r = getRoot(p.Character)
+			if r and (r.Position - leaderRoot.Position).Magnitude < 300 then
+				table.insert(nearby, p.Name)
+			end
+		end
+	end
+	table.sort(nearby)
+
+	local myIndex = 1
+	for i, n in ipairs(nearby) do
+		if n == localPlayer.Name then myIndex = i break end
+	end
+
+	local offset
+	if isSideways then
+		local sign = myIndex % 2 == 0 and 1 or -1
+		local mult = math.ceil(myIndex / 2)
+		offset = CFrame.new(sign * mult * 7, 0, 0)
+	else
+		offset = CFrame.new(0, 0, myIndex * 7)
+	end
+
+	followConn = RunService.Heartbeat:Connect(function()
+		local currLeader = Players:FindFirstChild(senderName)
+		if not currLeader or not currLeader.Character then return end
+		local lRoot = getRoot(currLeader.Character)
+		if myHum and lRoot then
+			myHum:MoveTo((lRoot.CFrame * offset).Position)
+		end
+	end)
+end
+
+local function cmd_spin(speedArg: string?)
+	cmd_unspin() 
+	local root = getRoot(localPlayer.Character)
+	if root then
+		local att = Instance.new("Attachment", root)
+		att.Name = "KekeSpinAtt"
+		local av = Instance.new("AngularVelocity", root)
+		av.Name = "KekeSpin"
+		av.Attachment0 = att
+		av.AngularVelocity = Vector3.new(0, tonumber(speedArg) or 25, 0)
+		av.MaxTorque = math.huge
+		av.RelativeTo = Enum.ActuatorRelativeTo.Attachment0
+	end
+end
+
+local function cmd_unspin()
+	local root = getRoot(localPlayer.Character)
+	if root then
+		local av = root:FindFirstChild("KekeSpin")
+		if av then av:Destroy() end
+		local att = root:FindFirstChild("KekeSpinAtt")
+		if att then att:Destroy() end
+	end
+end
+
+local function cmd_fling()
+	cmd_unfling()
+	local root = getRoot(localPlayer.Character)
+	local char = localPlayer.Character
+	if root and char then
+		local bav = Instance.new("BodyAngularVelocity", root)
+		bav.Name = "KekeFlingBAV"
+		bav.AngularVelocity = Vector3.new(0, 99999, 0)
+		bav.MaxTorque = Vector3.new(0, math.huge, 0)
+		bav.P = math.huge
+		
+		for _, v in ipairs(char:GetDescendants()) do
+			if v:IsA("BasePart") then
+				v.CustomPhysicalProperties = PhysicalProperties.new(100, 0.3, 0.5)
+			end
+		end
+	end
+end
+
+local function cmd_unfling()
+	local root = getRoot(localPlayer.Character)
+	local char = localPlayer.Character
+	if root then
+		local bav = root:FindFirstChild("KekeFlingBAV")
+		if bav then bav:Destroy() end
+	end
+	if char then
+		for _, v in ipairs(char:GetDescendants()) do
+			if v:IsA("BasePart") then
+				v.CustomPhysicalProperties = PhysicalProperties.new(0.7, 0.3, 0.5)
+			end
+		end
+	end
+end
+
+local function cmd_dance()
+	local char = localPlayer.Character
+	local hum = char and char:FindFirstChildOfClass("Humanoid")
+	if not hum then return end
+
+	if danceTrack then pcall(function() danceTrack:Stop() end) end
+
+	local animator = hum:FindFirstChildOfClass("Animator") or Instance.new("Animator", hum)
+	local anim = Instance.new("Animation")
+	anim.AnimationId = isR15(char) and "rbxassetid://507771019" or "rbxassetid://183289061"
+
+	pcall(function()
+		danceTrack = animator:LoadAnimation(anim)
+		danceTrack.Looped = true
+		danceTrack:Play()
+	end)
+end
+
+local function cmd_undance()
+	if danceTrack then 
+		pcall(function() danceTrack:Stop() end)
+		danceTrack = nil
+	end
+end
+
+local function cmd_jump()
+	local char = localPlayer.Character
+	if char then
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		if hum then hum.Jump = true end
+	end
+end
+
+local function cmd_sit()
+	local char = localPlayer.Character
+	if char then
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		if hum then hum.Sit = true end
+	end
+end
+
+local function cmd_freeze()
+	local root = getRoot(localPlayer.Character)
+	if root then root.Anchored = true end
+end
+
+local function cmd_thaw()
+	local root = getRoot(localPlayer.Character)
+	if root then root.Anchored = false end
+end
+
+local function cmd_noclip()
+	if noclipConn then noclipConn:Disconnect() end
+	noclipConn = RunService.Stepped:Connect(function()
+		local char = localPlayer.Character
+		if char then
+			for _, part in ipairs(char:GetDescendants()) do
+				if part:IsA("BasePart") and part.CanCollide then
+					part.CanCollide = false
+				end
+			end
+		end
+	end)
+end
+
+local function cmd_clip()
+	if noclipConn then 
+		noclipConn:Disconnect() 
+		noclipConn = nil 
+	end
+end
+
+local function cmd_infjump()
+	if infJumpConn then infJumpConn:Disconnect() end
+	infJumpConn = UserInputService.JumpRequest:Connect(function()
+		local char = localPlayer.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if hum then
+			hum:ChangeState(Enum.HumanoidStateType.Jumping)
+		end
+	end)
+end
+
+local function cmd_uninf()
+	if infJumpConn then infJumpConn:Disconnect() infJumpConn = nil end
+end
+
+local function cmd_grant(targetName: string)
+	if not targetName or targetName == "" then return end
+	local targets = findPlayersByName(targetName)
+	local actualName = targetName
+	if #targets > 0 then actualName = targets[1].Name end
+	owners[actualName] = true
+	logDebug("👑 granted admin rights to: " .. actualName)
+end
+
+local function cmd_quit()
+	if isMain then return end
+	pcall(function() game:Shutdown() end)
+	pcall(function() localPlayer:Kick("queen out 💅✨") end)
+end
+
+-- 🌈 flawless execution engine 🌈
+local function executeCommand(senderName: string, cmdLetter: string, targetArg: string)
+	local target = targetArg or ""
+	local extra = ""
+	if string.find(target, " ") then
+		local split = string.split(target, " ")
+		target = split[1]
+		extra = split[2]
+	end
+
+	if senderName == localPlayer.Name and isMain then
+		if string.lower(target) ~= "all" then return end
+	end
+
+	if target ~= "" and string.lower(target) ~= "all" then
+		local foundTargets = findPlayersByName(target)
+		local amITargeted = false
+		for _, p in ipairs(foundTargets) do
+			if p == localPlayer then amITargeted = true break end
+		end
+		if not amITargeted and cmdLetter ~= "ws" and cmdLetter ~= "jp" then return end
+	end
+	
+	logDebug("📥 executing parsed command: " .. cmdLetter .. " | target: " .. tostring(target))
+
+	if cmdLetter == "r" or cmdLetter == "reset" then cmd_reset()
+	elseif cmdLetter == "b" or cmdLetter == "bang" then cmd_bang(target, extra)
+	elseif cmdLetter == "x" or cmdLetter == "unbang" then cleanupBang()
+	elseif cmdLetter == "g" or cmdLetter == "goto" then cmd_goto(senderName) 
+	elseif cmdLetter == "k" or cmdLetter == "bring" then cmd_goto(senderName)
+	elseif cmdLetter == "f" or cmdLetter == "follow" then cmd_follow(senderName)
+	elseif cmdLetter == "u" or cmdLetter == "unfollow" then cmd_unfollow()
+	elseif cmdLetter == "l" or cmdLetter == "line" then cmd_formation(senderName, true)
+	elseif cmdLetter == "c" or cmdLetter == "column" then cmd_formation(senderName, false)
+	elseif cmdLetter == "s" or cmdLetter == "spin" then cmd_spin(extra)
+	elseif cmdLetter == "y" or cmdLetter == "unspin" then cmd_unspin()
+	elseif cmdLetter == "fl" or cmdLetter == "fling" then cmd_fling()
+	elseif cmdLetter == "uf" or cmdLetter == "unfling" then cmd_unfling()
+	elseif cmdLetter == "d" or cmdLetter == "dance" then cmd_dance()
+	elseif cmdLetter == "v" or cmdLetter == "undance" then cmd_undance()
+	elseif cmdLetter == "n" or cmdLetter == "noclip" then cmd_noclip()
+	elseif cmdLetter == "p" or cmdLetter == "clip" then cmd_clip()
+	elseif cmdLetter == "q" or cmdLetter == "quit" then cmd_quit()
+	elseif cmdLetter == "j" or cmdLetter == "jump" then cmd_jump()
+	elseif cmdLetter == "t" or cmdLetter == "sit" then cmd_sit()
+	elseif cmdLetter == "z" or cmdLetter == "freeze" then cmd_freeze()
+	elseif cmdLetter == "w" or cmdLetter == "thaw" then cmd_thaw()
+	elseif cmdLetter == "i" or cmdLetter == "infjump" then cmd_infjump()
+	elseif cmdLetter == "o" or cmdLetter == "uninf" then cmd_uninf()
+	elseif cmdLetter == "ws" then
+		local char = localPlayer.Character
+		if char and char:FindFirstChildOfClass("Humanoid") then
+			char:FindFirstChildOfClass("Humanoid").WalkSpeed = tonumber(target) or 16
+		end
+	elseif cmdLetter == "jp" then
+		local char = localPlayer.Character
+		if char and char:FindFirstChildOfClass("Humanoid") then
+			local hum = char:FindFirstChildOfClass("Humanoid")
+			hum.JumpPower = tonumber(target) or 50
+			hum.UseJumpPower = true
+		end
+	elseif cmdLetter == "e" or cmdLetter == "erase" then 
+		cmd_unfollow()
+		cmd_unspin()
+		cleanupBang()
+		cmd_uninf()
+		cmd_undance()
+		cmd_clip()
+		cmd_unfling()
+	elseif cmdLetter == "h" or cmdLetter == "grant" then cmd_grant(target)
+	end
+end
+
+local function handleIncomingChat(senderName: string, text: string)
+	if not isMain then return end 
+	if not owners[senderName] then return end
+	if string.sub(text, 1, 1) ~= "." then return end
+
+	local parts = {}
+	for token in string.gmatch(text, "%S+") do table.insert(parts, token) end
+	if #parts == 0 then return end
+	
+	local cmdWord = string.lower(string.sub(parts[1], 2))
+	local target = parts[2] or ""
+	local extra = parts[3] or ""
+
+	local letter = cmdMap[cmdWord] or cmdWord
+	
+	logDebug("💬 parsed chat from " .. senderName .. ": " .. cmdWord)
+	sendCommand(letter, target .. (extra ~= "" and (" " .. extra) or ""), senderName)
+end
+
+if isMain then
+	RunService.Heartbeat:Connect(function()
+		local char = localPlayer.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if hum then
+			if hum.WalkSpeed ~= lastWs then
+				lastWs = hum.WalkSpeed
+				logDebug("🏃‍♀️ walkspeed changed locally to: " .. tostring(lastWs))
+				sendCommand("ws", tostring(lastWs))
+			end
+			if hum.JumpPower ~= lastJp then
+				lastJp = hum.JumpPower
+				logDebug("🦘 jumppower changed locally to: " .. tostring(lastJp))
+				sendCommand("jp", tostring(lastJp))
+			end
+		end
+	end)
+end
+
+if not isMain then
+	RunService.Heartbeat:Connect(function()
+		local mainPlayer = Players:FindFirstChild("tayIorkeke33")
+		if mainPlayer and mainPlayer.Character then
+			local mainHum = mainPlayer.Character:FindFirstChildOfClass("Humanoid")
+			local myChar = localPlayer.Character
+			local myHum = myChar and myChar:FindFirstChildOfClass("Humanoid")
+			
+			if mainHum and myHum then
+				local mainState = mainHum:GetState()
+				if mainState == Enum.HumanoidStateType.Jumping then
+					myHum:ChangeState(Enum.HumanoidStateType.Jumping)
+				end
+			end
+		end
+	end)
+end
+
+RunService.Heartbeat:Connect(function()
+	pcall(function()
+		if isfile and isfile(ipcFile) then
+			local content = readfile(ipcFile)
+			if content and content ~= "" then
+				local data = HttpService:JSONDecode(content)
+				if data and data.t and data.t > lastProcessedTick then
+					lastProcessedTick = data.t
+					executeCommand(data.s, data.c, data.a)
+				end
+			end
+		end
+	end)
+end)
+
+if isMain then
+	GuiService.ErrorMessageChanged:Connect(function()
+		pcall(function() if writefile then writefile(ipcFile, "") end end)
+		logDebug("⚠️ disconnected/kicked! file erased.")
+	end)
+end
+
+local function connectTextChatService()
+	if not TextChatService then return end
+	local conn = TextChatService.MessageReceived:Connect(function(message)
+		local text = message and message.Text or ""
+		local source = message and message.TextSource
+		local name = source and source.Name or ""
+		if text ~= "" and name ~= "" then handleIncomingChat(name, text) end
+	end)
+	table.insert(connections, conn)
+end
+
+local function connectLegacyChat()
+	local defaultEvents = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+	if not defaultEvents then return end
+	local onMessage = defaultEvents:FindFirstChild("OnMessageDoneFiltering")
+	if not onMessage or not onMessage:IsA("RemoteEvent") then return end
+	local conn = onMessage.OnClientEvent:Connect(function(data)
+		local text = data and data.Message or ""
+		local name = data and data.FromSpeaker or ""
+		if text ~= "" and name ~= "" then handleIncomingChat(name, text) end
+	end)
+	table.insert(connections, conn)
+end
+
+if isMain then
+	if TextChatService and TextChatService:FindFirstChild("ChatVersion") == nil then
+		connectTextChatService()
+	else
+		connectTextChatService()
+		if #connections == 0 then connectLegacyChat() end
+	end
+end
+
+-- ✨🎀 LUXURY OWNER PANEL (MAIN ONLY) 🎀✨
+if isMain then
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Name = "keke_luxury_gui"
+	screenGui.ResetOnSpawn = false
+	screenGui.IgnoreGuiInset = true
+	screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	screenGui.Parent = localPlayer:WaitForChild("PlayerGui")
+
+	local panel = Instance.new("Frame")
+	panel.Name = "Panel"
+	panel.Size = UDim2.fromOffset(380, 500) 
+	panel.Position = UDim2.fromScale(0.5, 0.5)
+	panel.AnchorPoint = Vector2.new(0.5, 0.5)
+	panel.BorderSizePixel = 0
+	panel.Parent = screenGui
+	
+	local panelGradient = Instance.new("UIGradient")
+	panelGradient.Color = ColorSequence.new{
+		ColorSequenceKeypoint.new(0, Color3.fromRGB(30, 20, 35)),
+		ColorSequenceKeypoint.new(1, Color3.fromRGB(15, 10, 20))
+	}
+	panelGradient.Rotation = 45
+	panelGradient.Parent = panel
+
+	local uicorner = Instance.new("UICorner")
+	uicorner.CornerRadius = UDim.new(0, 16)
+	uicorner.Parent = panel
+	
+	local uistroke = Instance.new("UIStroke")
+	uistroke.Color = Color3.fromRGB(255, 150, 200)
+	uistroke.Thickness = 2
+	uistroke.Transparency = 0.2
+	uistroke.Parent = panel
+
+	local header = Instance.new("Frame")
+	header.Size = UDim2.new(1, 0, 0, 40)
+	header.BackgroundTransparency = 1
+	header.Parent = panel
+
+	local title = Instance.new("TextLabel")
+	title.Text = "✨ luxury manager ✨"
+	title.Font = Enum.Font.GothamBold
+	title.TextColor3 = Color3.fromRGB(255, 180, 215)
+	title.TextSize = 18
+	title.Size = UDim2.new(1, 0, 1, 0)
+	title.BackgroundTransparency = 1
+	title.Parent = header
+
+	local targetInput = Instance.new("TextBox")
+	targetInput.PlaceholderText = "target bot name... (leave empty for all) 🌈"
+	targetInput.Size = UDim2.new(1, -40, 0, 40)
+	targetInput.Position = UDim2.fromOffset(20, 45)
+	targetInput.BackgroundColor3 = Color3.fromRGB(45, 35, 55)
+	targetInput.TextColor3 = Color3.fromRGB(255, 255, 255)
+	targetInput.PlaceholderColor3 = Color3.fromRGB(170, 150, 180)
+	targetInput.Font = Enum.Font.GothamMedium
+	targetInput.TextSize = 14
+	targetInput.Text = ""
+	targetInput.Parent = panel
+
+	local targetCorner = Instance.new("UICorner")
+	targetCorner.CornerRadius = UDim.new(0, 8)
+	targetCorner.Parent = targetInput
+
+	local gridFrame = Instance.new("Frame")
+	gridFrame.Size = UDim2.new(1, -40, 1, -100)
+	gridFrame.Position = UDim2.fromOffset(20, 95)
+	gridFrame.BackgroundTransparency = 1
+	gridFrame.Parent = panel
+
+	local gridLayout = Instance.new("UIGridLayout")
+	gridLayout.CellSize = UDim2.new(0.31, 0, 0, 34)
+	gridLayout.CellPadding = UDim2.new(0.035, 0, 0, 10)
+	gridLayout.Parent = gridFrame
+	
+	local spinPrompt = Instance.new("Frame")
+	spinPrompt.Size = gridFrame.Size
+	spinPrompt.Position = gridFrame.Position
+	spinPrompt.BackgroundTransparency = 1
+	spinPrompt.Visible = false
+	spinPrompt.Parent = panel
+
+	local spinInput = Instance.new("TextBox")
+	spinInput.Size = UDim2.new(1, 0, 0, 45)
+	spinInput.PlaceholderText = "enter spin speed (number)... 🌪️"
+	spinInput.BackgroundColor3 = Color3.fromRGB(45, 35, 55)
+	spinInput.TextColor3 = Color3.fromRGB(255, 255, 255)
+	spinInput.Font = Enum.Font.GothamMedium
+	spinInput.TextSize = 14
+	spinInput.Text = ""
+	spinInput.Parent = spinPrompt
+
+	local spinCorner = Instance.new("UICorner")
+	spinCorner.CornerRadius = UDim.new(0, 8)
+	spinCorner.Parent = spinInput
+
+	local spinBtnConfirm = Instance.new("TextButton")
+	spinBtnConfirm.Size = UDim2.new(1, 0, 0, 45)
+	spinBtnConfirm.Position = UDim2.new(0, 0, 0, 60)
+	spinBtnConfirm.Text = "confirm spin ✨"
+	spinBtnConfirm.BackgroundColor3 = Color3.fromRGB(55, 45, 70)
+	spinBtnConfirm.TextColor3 = Color3.fromRGB(240, 230, 255)
+	spinBtnConfirm.Font = Enum.Font.GothamBold
+	spinBtnConfirm.TextSize = 14
+	spinBtnConfirm.Parent = spinPrompt
+
+	local spinBtnCorner = Instance.new("UICorner")
+	spinBtnCorner.CornerRadius = UDim.new(0, 8)
+	spinBtnCorner.Parent = spinBtnConfirm
+
+	local cancelSpinBtn = Instance.new("TextButton")
+	cancelSpinBtn.Size = UDim2.new(1, 0, 0, 45)
+	cancelSpinBtn.Position = UDim2.new(0, 0, 0, 120)
+	cancelSpinBtn.Text = "cancel 💅"
+	cancelSpinBtn.BackgroundColor3 = Color3.fromRGB(180, 60, 80)
+	cancelSpinBtn.TextColor3 = Color3.fromRGB(240, 230, 255)
+	cancelSpinBtn.Font = Enum.Font.GothamBold
+	cancelSpinBtn.TextSize = 14
+	cancelSpinBtn.Parent = spinPrompt
+
+	local cancelCorner = Instance.new("UICorner")
+	cancelCorner.CornerRadius = UDim.new(0, 8)
+	cancelCorner.Parent = cancelSpinBtn
+
+	local dragging = false
+	local dragStart = nil
+	local startPos = nil
+
+	header.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = panel.Position
+		end
+	end)
+
+	header.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+
+	UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) and dragStart and startPos then
+			local delta = input.Position - dragStart
+			panel.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+		end
+	end)
+
+	local cmds = {
+		"bring", "follow", "unfollow", 
+		"bang", "unbang", "noclip", "clip",
+		"spin", "unspin", "line", "column", 
+		"dance", "undance", "fling", "unfling",
+		"jump", "sit", "freeze", "thaw", 
+		"infjump", "uninf", "quit", "erase", 
+		"reset", "grant"
+	}
+	
+	for _, c in ipairs(cmds) do
+		local btn = Instance.new("TextButton")
+		btn.Text = c
+		
+		if c == "erase" or c == "quit" then
+			btn.BackgroundColor3 = Color3.fromRGB(180, 60, 80)
+		else
+			btn.BackgroundColor3 = Color3.fromRGB(55, 45, 70)
+		end
+		
+		btn.TextColor3 = Color3.fromRGB(240, 230, 255)
+		btn.Font = Enum.Font.GothamMedium
+		btn.TextSize = 13
+		btn.Parent = gridFrame
+		
+		local btnCorner = Instance.new("UICorner")
+		btnCorner.CornerRadius = UDim.new(0, 6)
+		btnCorner.Parent = btn
+		
+		btn.MouseEnter:Connect(function() 
+			if c == "erase" or c == "quit" then btn.BackgroundColor3 = Color3.fromRGB(210, 80, 100)
+			else btn.BackgroundColor3 = Color3.fromRGB(80, 60, 100) end
+		end)
+		btn.MouseLeave:Connect(function() 
+			if c == "erase" or c == "quit" then btn.BackgroundColor3 = Color3.fromRGB(180, 60, 80)
+			else btn.BackgroundColor3 = Color3.fromRGB(55, 45, 70) end
+		end)
+		
+		btn.MouseButton1Click:Connect(function()
+			if c == "spin" then
+				gridFrame.Visible = false
+				spinPrompt.Visible = true
+				return
+			end
+			
+			local t = targetInput.Text
+			if string.lower(t) == "all" then
+				t = "all"
+			elseif t ~= "" then
+				local found = findPlayersByName(t)
+				if #found > 0 then
+					t = found[1].Name
+					targetInput.Text = t
+				end
+			end
+			
+			if c == "erase" then
+				sendCommand("e", "")
+				task.delay(1, function() pcall(function() writefile(ipcFile, "") end) end)
+				return
+			end
+			
+			local letter = cmdMap[c] or c
+			sendCommand(letter, t)
+		end)
+	end
+	
+	spinBtnConfirm.MouseButton1Click:Connect(function()
+		local t = targetInput.Text
+		if string.lower(t) == "all" then t = "all"
+		elseif t == "" then t = "all"
+		else
+			local found = findPlayersByName(t)
+			if #found > 0 then t = found[1].Name targetInput.Text = t end
+		end
+		
+		local speed = spinInput.Text
+		if speed == "" then speed = "15" end
+		
+		spinPrompt.Visible = false
+		gridFrame.Visible = true
+		spinInput.Text = ""
+		
+		sendCommand(cmdMap["spin"], t .. " " .. speed)
+	end)
+	
+	cancelSpinBtn.MouseButton1Click:Connect(function()
+		spinPrompt.Visible = false
+		gridFrame.Visible = true
+		spinInput.Text = ""
+	end)
+end

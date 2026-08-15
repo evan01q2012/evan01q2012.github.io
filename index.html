@@ -1,8 +1,56 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <meta http-equiv="refresh" content="0; url=https://scriptsfor.me" />
-    <script>window.location.href = "https://scriptsfor.me";</script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>scriptsfor.me ✨</title>
+    
+    <script>
+        if (window.location.hostname.includes("github.io")) {
+            window.location.replace("https://scriptsfor.me" + window.location.pathname);
+        }
+    </script>
+
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        body { background: #0f0a14; color: #f5edf8; display: flex; flex-direction: column; align-items: center; min-height: 100vh; padding: 40px 20px; }
+        h1 { color: #ff96c8; font-size: 2.5rem; margin-bottom: 8px; font-weight: 800; }
+        p.subtitle { color: #b4a0bc; margin-bottom: 35px; font-size: 1rem; }
+        .grid { display: flex; flex-direction: column; gap: 20px; width: 100%; max-width: 600px; }
+        .card { background: linear-gradient(135deg, #1e1423, #140d1a); border: 2px solid #ff96c833; border-radius: 16px; padding: 24px; box-shadow: 0 8px 30px rgba(0,0,0,0.5); transition: 0.2s; }
+        .card:hover { border-color: #ff96c8aa; transform: translateY(-2px); }
+        .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+        .card-title { font-size: 1.25rem; font-weight: 700; color: #ffb4d7; }
+        .badge { background: #ff96c822; color: #ff96c8; padding: 4px 10px; border-radius: 20px; font-size: 0.75rem; font-weight: 600; }
+        .card-desc { color: #d0c0d8; font-size: 0.9rem; line-height: 1.4; margin-bottom: 18px; }
+        .btn { background: #ff96c8; color: #1e1423; border: none; border-radius: 8px; padding: 12px 18px; font-size: 0.95rem; font-weight: 700; cursor: pointer; width: 100%; transition: 0.2s; }
+        .btn:hover { background: #ffb4d7; }
+    </style>
 </head>
-<body></body>
+<body>
+    <h1>scriptsfor.me ✨</h1>
+    <p class="subtitle">multi-bot automation</p>
+
+    <div class="grid">
+        <div class="card">
+            <div class="card-header">
+                <span class="card-title">luxury manager</span>
+                <span class="badge">working 🟢</span>
+            </div>
+            <p class="card-desc">stealth file-bridge bot controller with formations, noclip, speed-sync, and luxury aesthetic.</p>
+            <button class="btn" onclick="copyLoadstring(this, 'https://scriptsfor.me/altscript')">copy loadstring 📋</button>
+        </div>
+    </div>
+
+    <script>
+        function copyLoadstring(btn, rawUrl) {
+            const formattedCode = `loadstring(game:HttpGet("${rawUrl}"))()`;
+            navigator.clipboard.writeText(formattedCode);
+            
+            const original = btn.innerText;
+            btn.innerText = "copied!";
+            setTimeout(() => { btn.innerText = original; }, 2000);
+        }
+    </script>
+</body>
 </html>
